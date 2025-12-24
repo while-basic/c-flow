@@ -107,6 +107,9 @@ ${chalk.bold('EXAMPLES:')}
   ${chalk.gray('# Spawn with Claude Code coordination')}
   claude-flow hive-mind spawn "Build REST API" --claude
 
+  ${chalk.gray('# Spawn with Ollama (local models with web search)')}
+  claude-flow hive-mind spawn "Research AI trends" --ollama --model gemma3:1b
+
   ${chalk.gray('# Auto-spawn coordinated Claude Code instances')}
   claude-flow hive-mind spawn "Research AI trends" --auto-spawn --verbose
 
@@ -137,6 +140,10 @@ ${chalk.bold('OPTIONS:')}
   --verbose              Detailed logging
   --claude               Generate Claude Code spawn commands with coordination
   --spawn                Alias for --claude
+  --ollama               Use Ollama for local model execution (with web search)
+  --model <name>         Ollama model name (default: gemma3:1b, codellama:7b, deepseek-coder:1.3b, etc.)
+  --ollama-url <url>     Ollama API URL (default: http://localhost:11434)
+  --no-web-search        Disable web search (use with --ollama)
   --auto-spawn           Automatically spawn Claude Code instances
   --execute              Execute Claude Code spawn commands immediately
 
@@ -975,10 +982,13 @@ async function spawnSwarm(args, flags) {
     process.on('SIGINT', sigintHandler);
     process.on('SIGTERM', sigintHandler);
 
-    // Offer to spawn Claude Code instances with coordination instructions
+    // Offer to spawn AI instances with coordination instructions
     // Spawn Claude if --claude or --spawn flag is set
+    // Spawn Ollama if --ollama flag is set
     if (flags.claude || flags.spawn) {
       await spawnClaudeCodeInstances(swarmId, hiveMind.config.name, objective, workers, flags);
+    } else if (flags.ollama) {
+      await spawnOllamaInstances(swarmId, hiveMind.config.name, objective, workers, flags);
     } else {
       console.log(
         '\n' +
@@ -986,6 +996,12 @@ async function spawnSwarm(args, flags) {
           ' Add --claude to spawn coordinated Claude Code instances',
       );
       console.log(chalk.gray('   claude-flow hive-mind spawn "objective" --claude'));
+      console.log(
+        '\n' +
+          chalk.blue('💡 Pro Tip:') +
+          ' Add --ollama to use Ollama with web search',
+      );
+      console.log(chalk.gray('   claude-flow hive-mind spawn "objective" --ollama --model gemma3:1b'));
     }
 
     // Return swarm info for wizard use
@@ -2194,17 +2210,99 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
       await writeFile(promptFile, hiveMindPrompt, 'utf8');
       console.log(chalk.green(`\n✓ Hive Mind prompt saved to: ${promptFile}`));
 
-      // Check if claude command exists
+      // Check if claude command exists (cross-platform)
       const { spawn: childSpawn, execSync } = await import('child_process');
+      const { platform } = await import('os');
+      const isWindows = platform() === 'win32';
+      
+      // On Windows, ALWAYS use npx - don't even check for claude
+      // This avoids issues with 'where' command false positives
+      let claudeCommand = 'npx';
       let claudeAvailable = false;
 
-      try {
-        execSync('which claude', { stdio: 'ignore' });
-        claudeAvailable = true;
-      } catch {
-        console.log(chalk.yellow('\n⚠️  Claude Code CLI not found in PATH'));
-        console.log(chalk.gray('Install it with: npm install -g @anthropic-ai/claude-code'));
-        console.log(chalk.gray('\nFalling back to displaying instructions...'));
+      if (isWindows) {
+        // Windows: Always use npx, find the actual executable path
+        try {
+          // Find npx.cmd path on Windows - where returns multiple lines, get the first valid one
+          const whereOutput = execSync('where npx', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+          if (whereOutput && !whereOutput.includes('INFO: Could not find files')) {
+            // Split by newlines and get the first valid path
+            const paths = whereOutput.split('\r\n').concat(whereOutput.split('\n'))
+              .map(p => p.trim())
+              .filter(p => p && !p.includes('INFO:') && p.length > 0);
+            
+            if (paths.length > 0) {
+              // Prefer .cmd file if available, otherwise use the first path and add .cmd
+              let npxPath = paths.find(p => p.endsWith('.cmd')) || paths[0];
+              
+              // Clean up the path (remove any trailing whitespace or control characters)
+              npxPath = npxPath.trim().replace(/\r$/, '');
+              
+              // If path doesn't end with .cmd, try to find the .cmd version
+              if (!npxPath.endsWith('.cmd')) {
+                // Check if .cmd version exists by trying to find it in the paths
+                const cmdPath = paths.find(p => {
+                  const cleanP = p.trim().replace(/\r$/, '');
+                  return cleanP === npxPath + '.cmd' || cleanP.endsWith('npx.cmd');
+                });
+                if (cmdPath) {
+                  npxPath = cmdPath.trim().replace(/\r$/, '');
+                } else {
+                  // Add .cmd extension if it doesn't exist (Windows convention)
+                  npxPath = npxPath + '.cmd';
+                }
+              }
+              
+              // Verify the path looks valid (contains drive letter or starts with \)
+              if (npxPath.match(/^[A-Z]:\\/i) || npxPath.startsWith('\\')) {
+                claudeCommand = npxPath; // Use full path
+                claudeAvailable = true;
+                console.log(chalk.cyan('\n💡 Using npx to run @anthropic-ai/claude-code (recommended on Windows)'));
+                if (flags.verbose) {
+                  console.log(chalk.gray(`   Found npx at: ${npxPath}`));
+                }
+              } else {
+                throw new Error(`Invalid npx path: ${npxPath}`);
+              }
+            } else {
+              throw new Error('npx not found');
+            }
+          } else {
+            throw new Error('npx not found');
+          }
+        } catch {
+          console.log(chalk.yellow('\n⚠️  npx not available'));
+          console.log(chalk.gray('Please ensure npm is installed and in your PATH'));
+          console.log(chalk.gray('Install Node.js from: https://nodejs.org/'));
+          console.log(chalk.gray('\nFalling back to displaying instructions...'));
+        }
+      } else {
+        // Unix-like systems: Check for claude first, then fall back to npx
+        let claudeFound = false;
+        try {
+          execSync('command -v claude', { stdio: 'ignore', shell: true });
+          claudeFound = true;
+        } catch {
+          claudeFound = false;
+        }
+
+        if (claudeFound) {
+          claudeCommand = 'claude';
+          claudeAvailable = true;
+        } else {
+          // Claude not found, use npx
+          try {
+            execSync('command -v npx', { stdio: 'ignore', shell: true });
+            claudeAvailable = true;
+            console.log(chalk.yellow('\n⚠️  Claude Code CLI not found in PATH'));
+            console.log(chalk.gray('Using npx to run @anthropic-ai/claude-code...'));
+          } catch {
+            console.log(chalk.yellow('\n⚠️  Claude Code CLI not found in PATH'));
+            console.log(chalk.gray('Install it with: npm install -g @anthropic-ai/claude-code'));
+            console.log(chalk.gray('Or ensure npx is available to run it automatically'));
+            console.log(chalk.gray('\nFalling back to displaying instructions...'));
+          }
+        }
       }
 
       if (claudeAvailable && !flags.dryRun) {
@@ -2248,13 +2346,110 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
           }
         }
         
-        // Add the prompt as the LAST argument
-        claudeArgs.push(hiveMindPrompt);
+        // On Windows, avoid "command line too long" error
+        // Since Claude Code needs raw mode for interactive input, we can't pipe via stdin
+        // Instead, use a short prompt that references the file, or use environment variable
+        let claudeProcess;
+        
+        if (isWindows && (claudeCommand.endsWith('.cmd') || claudeCommand.includes('\\') || claudeCommand.includes(':'))) {
+          // Windows: Check if prompt would be too long for command line
+          const estimatedLength = hiveMindPrompt.length + claudeArgs.join(' ').length;
+          const WINDOWS_CMD_LIMIT = 8000; // Leave some buffer
+          
+          if (estimatedLength > WINDOWS_CMD_LIMIT) {
+            // Prompt too long - use environment variable and short prompt
+            const shortPrompt = `Read the Hive Mind coordination instructions from the file specified in CLAUDE_FLOW_PROMPT_FILE environment variable and execute them.`;
+            
+            // Replace the long prompt with the short one
+            const shortArgs = claudeArgs.map(arg => arg === hiveMindPrompt ? shortPrompt : arg);
+            
+            const spawnArgs = claudeCommand === 'npx' || claudeCommand.includes('npx')
+              ? ['-y', '@anthropic-ai/claude-code', ...shortArgs]
+              : shortArgs;
+            
+            // Escape the command path if it has spaces
+            const escapedCommand = claudeCommand.includes(' ') ? `"${claudeCommand}"` : claudeCommand;
+            const commandParts = spawnArgs.map(arg => {
+              // Escape arguments with spaces or special characters
+              if (arg.includes(' ') || arg.includes('"') || arg.includes('&') || arg.includes('|')) {
+                return `"${arg.replace(/"/g, '""')}"`;
+              }
+              return arg;
+            });
+            
+            const commandString = `${escapedCommand} ${commandParts.join(' ')}`;
+            
+            // Set environment variable with the prompt file path
+            const env = {
+              ...process.env,
+              CLAUDE_FLOW_PROMPT_FILE: promptFile,
+            };
+            
+            claudeProcess = childSpawn(commandString, [], {
+              stdio: 'inherit',
+              shell: true,
+              env: env,
+            });
+            
+            console.log(chalk.yellow('\n⚠️  Prompt too long for Windows command line'));
+            console.log(chalk.gray(`   Full prompt saved to: ${promptFile}`));
+            console.log(chalk.gray('   Using environment variable CLAUDE_FLOW_PROMPT_FILE'));
+            console.log(chalk.gray('   Claude Code will read the file as instructed'));
+          } else {
+            // Prompt is short enough - use it directly
+            const spawnArgs = claudeCommand === 'npx' || claudeCommand.includes('npx')
+              ? ['-y', '@anthropic-ai/claude-code', ...claudeArgs]
+              : claudeArgs;
+            
+            // Escape the command path if it has spaces
+            const escapedCommand = claudeCommand.includes(' ') ? `"${claudeCommand}"` : claudeCommand;
+            const commandParts = spawnArgs.map(arg => {
+              // Escape arguments with spaces or special characters
+              if (arg.includes(' ') || arg.includes('"') || arg.includes('&') || arg.includes('|')) {
+                return `"${arg.replace(/"/g, '""')}"`;
+              }
+              return arg;
+            });
+            
+            const commandString = `${escapedCommand} ${commandParts.join(' ')}`;
+            
+            claudeProcess = childSpawn(commandString, [], {
+              stdio: 'inherit',
+              shell: true,
+            });
+          }
+        } else {
+          // Unix or direct claude: Add the prompt as the LAST argument
+          claudeArgs.push(hiveMindPrompt);
+          
+          // If using npx, add the package name before other args
+          const spawnArgs = claudeCommand === 'npx' 
+            ? ['-y', '@anthropic-ai/claude-code', ...claudeArgs]
+            : claudeArgs;
 
-        // Spawn claude with properly ordered arguments
-        const claudeProcess = childSpawn('claude', claudeArgs, {
-          stdio: 'inherit',
-          shell: false,
+          // Debug: Log what we're about to spawn
+          if (flags.verbose) {
+            console.log(chalk.gray(`\n🔍 Debug: Spawning command: ${claudeCommand}`));
+            console.log(chalk.gray(`🔍 Debug: Args: ${spawnArgs.slice(0, 2).join(' ')}...`));
+          }
+
+          // Unix or direct claude command - use array format
+          claudeProcess = childSpawn(claudeCommand, spawnArgs, {
+            stdio: 'inherit',
+            shell: false,
+          });
+        }
+
+        // Handle spawn errors (e.g., command not found)
+        claudeProcess.on('error', (err) => {
+          console.error(chalk.red('\n❌ Failed to spawn Claude Code:'), err.message);
+          if (err.code === 'ENOENT') {
+            console.error(chalk.yellow('\n💡 Solution:'));
+            console.error(chalk.gray('  1. Install Claude Code: npm install -g @anthropic-ai/claude-code'));
+            console.error(chalk.gray('  2. Or ensure npx is available: npm install -g npm'));
+            console.error(chalk.gray('  3. Verify your PATH includes npm/npx directories'));
+          }
+          process.exit(1);
         });
 
         // Track child process PID in session
@@ -2384,6 +2579,406 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
     spinner.fail('Failed to prepare Claude Code coordination');
     console.error(chalk.red('Error:'), error.message);
   }
+}
+
+/**
+ * Spawn Ollama instances with Hive Mind coordination and web search
+ */
+async function spawnOllamaInstances(swarmId, swarmName, objective, workers, flags) {
+  console.log('\n' + chalk.bold('🦙 Launching Ollama with Hive Mind Coordination'));
+  console.log(chalk.gray('─'.repeat(60)));
+
+  const spinner = ora('Preparing Ollama coordination...').start();
+
+  try {
+    // Get model name (default to gemma3:1b for fast coding tasks, or use provided)
+    const modelName = flags.model || flags['ollama-model'] || 'gemma3:1b';
+    const ollamaUrl = flags['ollama-url'] || flags.ollamaUrl || process.env.OLLAMA_API_URL || 'http://localhost:11434';
+    
+    // Check if Ollama is available by calling the API directly
+    spinner.text = 'Checking Ollama connection...';
+    try {
+      const healthResponse = await fetch(`${ollamaUrl}/api/tags`);
+      if (!healthResponse.ok) {
+        throw new Error(`Ollama API returned status ${healthResponse.status}`);
+      }
+      
+      // Check if model is available
+      const modelsData = await healthResponse.json();
+      const availableModels = modelsData.models?.map(m => m.name) || [];
+      const modelAvailable = availableModels.some(m => 
+        m.includes(modelName) || m === modelName || modelName.includes(m.split(':')[0])
+      );
+      
+      if (!modelAvailable && availableModels.length > 0) {
+        console.warn(chalk.yellow(`\n⚠️  Model "${modelName}" not found in Ollama`));
+        console.log(chalk.gray('Available models:'), availableModels.join(', '));
+        console.log(chalk.gray(`\nTo pull the model, run: ollama pull ${modelName}`));
+        console.log(chalk.gray('Or use an available model with --model flag'));
+      }
+      
+      spinner.succeed('Ollama connection established!');
+    } catch (error) {
+      spinner.fail('Ollama not available');
+      console.error(chalk.red('Error:'), 'Cannot connect to Ollama at ' + ollamaUrl);
+      console.log(chalk.yellow('\n💡 Solution:'));
+      console.log(chalk.gray('1. Install Ollama: https://ollama.ai'));
+      console.log(chalk.gray(`2. Pull the model: ollama pull ${modelName}`));
+      console.log(chalk.gray(`3. Ensure Ollama is running: ollama serve`));
+      console.log(chalk.gray(`4. Or set OLLAMA_API_URL: export OLLAMA_API_URL=${ollamaUrl}`));
+      return;
+    }
+
+    // Generate Hive Mind prompt with web search instructions
+    // Use resume prompt if provided (for session resume)
+    const workerGroups = groupWorkersByType(workers);
+    const hiveMindPrompt = flags.resumePrompt || generateOllamaHiveMindPrompt(
+      swarmId,
+      swarmName,
+      objective,
+      workers,
+      workerGroups,
+      flags,
+      modelName,
+    );
+
+    spinner.succeed('Ollama coordination prompt ready!');
+
+    // Display coordination summary
+    console.log('\n' + chalk.bold('🧠 Hive Mind Configuration (Ollama)'));
+    console.log(chalk.gray('─'.repeat(60)));
+    console.log(chalk.cyan('Swarm ID:'), swarmId);
+    console.log(chalk.cyan('Objective:'), objective);
+    console.log(chalk.cyan('Model:'), modelName);
+    console.log(chalk.cyan('Ollama URL:'), ollamaUrl);
+    console.log(chalk.cyan('Queen Type:'), flags.queenType || 'strategic');
+    console.log(chalk.cyan('Worker Count:'), workers.length);
+    console.log(chalk.cyan('Worker Types:'), Object.keys(workerGroups).join(', '));
+    console.log(chalk.cyan('Web Search:'), 'Enabled');
+
+    // Save prompt file
+    const sessionsDir = path.join('.hive-mind', 'sessions');
+    await mkdirAsync(sessionsDir, { recursive: true });
+    const promptFile = path.join(sessionsDir, `hive-mind-ollama-prompt-${swarmId}.txt`);
+    await writeFile(promptFile, hiveMindPrompt, 'utf8');
+    console.log(chalk.green(`\n✓ Ollama prompt saved to: ${promptFile}`));
+
+    // Execute with Ollama and web search
+    if (!flags.dryRun) {
+      spinner.text = 'Executing with Ollama and web search...';
+      spinner.start();
+
+      try {
+        // Import web search utility
+        const { searchWeb, searchAndFetch } = await import('../../utils/web-search.js');
+        
+        // Enhanced prompt with web search integration
+        let enhancedPrompt = hiveMindPrompt;
+        
+        // If objective requires research, perform web search first
+        // Web search is enabled by default, can be disabled with --no-web-search
+        if (flags.webSearch !== false && !flags['no-web-search']) {
+          
+          spinner.text = 'Performing web search for context...';
+          
+          // Extract intelligent search queries from objective
+          const searchQueries = extractSearchQueries(objective);
+          
+          if (flags.verbose) {
+            console.log(chalk.gray(`\n🔍 Search queries: ${searchQueries.join(', ')}`));
+          }
+          
+          // Perform web searches with error handling
+          let searchResults;
+          try {
+            searchResults = await searchWebMultiple(searchQueries, { limit: 5 });
+          } catch (error) {
+            console.warn(chalk.yellow(`\n⚠️  Web search failed: ${error.message}`));
+            console.log(chalk.gray('Continuing without web search results...'));
+            searchResults = { results: [], totalResults: 0 };
+          }
+          
+          // Enhance prompt with search results
+          const searchContext = searchResults.results
+            .map((result, idx) => {
+              if (result.results && result.results.length > 0) {
+                const sourceNote = result.source === 'perplexity' ? ' (via Perplexity API)' : ' (via DuckDuckGo)';
+                return `\n\nSearch Query ${idx + 1}: "${result.query}"${sourceNote}\nResults:\n${result.results.map((r, i) => 
+                  `${i + 1}. ${r.title}\n   URL: ${r.url}\n   ${r.snippet ? r.snippet.substring(0, 200) : 'No snippet available'}\n`
+                ).join('\n')}`;
+              }
+              return '';
+            })
+            .filter(Boolean)
+            .join('\n');
+          
+          if (searchContext) {
+            enhancedPrompt = `${hiveMindPrompt}\n\n🔍 WEB SEARCH RESULTS:\n${searchContext}\n\nUse the above search results to inform your response. Cite sources when using information from the web search results.`;
+            
+            if (flags.verbose) {
+              console.log(chalk.gray(`\n✓ Found ${searchResults.totalResults} total search results`));
+            }
+          } else {
+            if (flags.verbose) {
+              console.log(chalk.yellow('\n⚠️  No search results found, proceeding without web context'));
+            }
+          }
+          
+          spinner.text = 'Generating response with Ollama...';
+        } else {
+          if (flags.verbose) {
+            console.log(chalk.gray('\n⏭️  Web search disabled, proceeding with base prompt'));
+          }
+        }
+        
+        // Use Ollama API directly to generate response
+        // Ensure prompt is safe for JSON (remove any problematic characters)
+        let safePrompt = enhancedPrompt;
+        try {
+          // Remove problematic characters that can break JSON
+          safePrompt = enhancedPrompt
+            .replace(/\u0000/g, '') // Remove null bytes
+            .replace(/[\u0001-\u0008\u000B\u000C\u000E-\u001F]/g, '') // Remove control characters
+            .replace(/\u2028/g, ' ') // Replace line separator
+            .replace(/\u2029/g, ' '); // Replace paragraph separator
+        } catch (cleanError) {
+          console.warn(chalk.yellow('Warning: Error cleaning prompt, using original'), cleanError.message);
+        }
+        
+        const requestBody = {
+          model: modelName,
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a Hive Mind Queen coordinator orchestrating multiple AI agents. You have access to web search results - use them to provide accurate, up-to-date information. Cite sources when referencing web search results.',
+            },
+            {
+              role: 'user',
+              content: safePrompt,
+            },
+          ],
+          options: {
+            temperature: 0.7,
+            top_p: 0.9,
+            num_predict: 4096,
+          },
+          stream: false,
+        };
+        
+        let requestBodyString;
+        try {
+          requestBodyString = JSON.stringify(requestBody, null, 0);
+          if (flags.verbose) {
+            console.log(chalk.gray(`\n📤 Request size: ${requestBodyString.length} characters`));
+          }
+        } catch (jsonError) {
+          const errorMsg = `Failed to serialize request to JSON: ${jsonError.message}`;
+          if (flags.verbose) {
+            console.error(chalk.red('\n❌ JSON Serialization Error:'));
+            console.error(chalk.gray(`Prompt length: ${safePrompt.length}`));
+            console.error(chalk.gray(`Error: ${jsonError.stack || jsonError.message}`));
+          }
+          throw new Error(errorMsg);
+        }
+        
+        let ollamaResponse;
+        try {
+          ollamaResponse = await fetch(`${ollamaUrl}/api/chat`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: requestBodyString,
+          });
+        } catch (fetchError) {
+          throw new Error(`Failed to connect to Ollama: ${fetchError.message}. Make sure Ollama is running at ${ollamaUrl}`);
+        }
+        
+        // Read response text once
+        let responseText;
+        try {
+          responseText = await ollamaResponse.text();
+        } catch (readError) {
+          throw new Error(`Failed to read response from Ollama: ${readError.message}`);
+        }
+        
+        if (!ollamaResponse.ok) {
+          const errorPreview = responseText ? responseText.substring(0, 500) : 'No response body';
+          throw new Error(`Ollama API error (${ollamaResponse.status} ${ollamaResponse.statusText}): ${errorPreview}`);
+        }
+        
+        // Parse response with error handling
+        let ollamaData;
+        try {
+          if (!responseText || responseText.trim() === '') {
+            throw new Error('Empty response from Ollama API');
+          }
+          
+          // Try to parse JSON
+          ollamaData = JSON.parse(responseText);
+        } catch (parseError) {
+          // Provide detailed error information
+          const errorDetails = {
+            message: parseError.message,
+            responseLength: responseText.length,
+            responseStart: responseText.substring(0, 100),
+            responseEnd: responseText.substring(Math.max(0, responseText.length - 100)),
+          };
+          
+          if (flags.verbose) {
+            console.error(chalk.red('\n❌ JSON Parse Error Details:'));
+            console.error(chalk.gray(JSON.stringify(errorDetails, null, 2)));
+          }
+          
+          throw new Error(
+            `Failed to parse Ollama response: ${parseError.message}\n` +
+            `Response length: ${responseText.length} chars\n` +
+            `First 200 chars: ${responseText.substring(0, 200)}\n` +
+            `Last 200 chars: ${responseText.substring(Math.max(0, responseText.length - 200))}`
+          );
+        }
+        
+        const response = {
+          content: ollamaData.message?.content || ollamaData.response || '',
+          model: modelName,
+          usage: {
+            promptTokens: ollamaData.prompt_eval_count || 0,
+            completionTokens: ollamaData.eval_count || 0,
+            totalTokens: (ollamaData.prompt_eval_count || 0) + (ollamaData.eval_count || 0),
+          },
+        };
+
+        spinner.succeed('Ollama execution completed!');
+        
+        console.log('\n' + chalk.bold('📊 Response:'));
+        console.log(chalk.gray('─'.repeat(60)));
+        console.log(response.content);
+        
+        // Save response
+        const responseFile = path.join(sessionsDir, `hive-mind-ollama-response-${swarmId}.txt`);
+        await writeFile(responseFile, response.content, 'utf8');
+        console.log(chalk.green(`\n✓ Response saved to: ${responseFile}`));
+
+      } catch (error) {
+        spinner.fail('Ollama execution failed');
+        console.error(chalk.red('Error:'), error.message);
+        throw error;
+      }
+    } else {
+      console.log(chalk.blue('\nDry run - would execute Ollama with prompt:'));
+      console.log(chalk.gray('Prompt length:'), hiveMindPrompt.length, 'characters');
+      console.log(chalk.gray(`\nFull prompt saved to: ${promptFile}`));
+    }
+
+    console.log('\n' + chalk.bold('💡 Pro Tips:'));
+    console.log(chalk.gray('─'.repeat(30)));
+    console.log('• Use --model to specify different Ollama models');
+    console.log('• Web search is automatically enabled (use --no-web-search to disable)');
+    console.log('• For better search results, set PERPLEXITY_API_KEY in .env');
+    console.log('• Monitor with: claude-flow hive-mind status');
+    console.log('• Check Ollama logs: ollama logs');
+
+  } catch (error) {
+    spinner.fail('Failed to prepare Ollama coordination');
+    console.error(chalk.red('Error:'), error.message);
+  }
+}
+
+/**
+ * Extract intelligent search queries from objective
+ */
+function extractSearchQueries(objective) {
+  // Remove common stop words and extract meaningful phrases
+  const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can']);
+  
+  // Split into words and filter
+  const words = objective.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !stopWords.has(w));
+  
+  // Create queries: full objective, key phrases, and individual important terms
+  const queries = [
+    objective, // Full objective as primary query
+  ];
+  
+  // Extract key phrases (2-3 word combinations)
+  for (let i = 0; i < words.length - 1; i++) {
+    const phrase = `${words[i]} ${words[i + 1]}`;
+    if (phrase.length > 8) {
+      queries.push(phrase);
+    }
+  }
+  
+  // Add important individual terms
+  const importantTerms = words.filter(w => w.length > 5).slice(0, 2);
+  queries.push(...importantTerms);
+  
+  // Remove duplicates and limit
+  return [...new Set(queries)].slice(0, 3);
+}
+
+/**
+ * Generate Hive Mind prompt optimized for Ollama with web search
+ */
+function generateOllamaHiveMindPrompt(swarmId, swarmName, objective, workers, workerGroups, flags, modelName) {
+  const workerTypesList = Object.keys(workerGroups).join(', ');
+  const workerCount = workers.length;
+
+  return `🧠 HIVE MIND COLLECTIVE INTELLIGENCE SYSTEM (Ollama ${modelName})
+═══════════════════════════════════════════════
+
+You are the Queen coordinator of a Hive Mind swarm using Ollama (${modelName}) with web search capabilities.
+
+HIVE MIND CONFIGURATION:
+📌 Swarm ID: ${swarmId}
+📌 Swarm Name: ${swarmName}
+🎯 Objective: ${objective}
+👑 Queen Type: ${flags.queenType || 'strategic'}
+🐝 Worker Count: ${workerCount}
+🤝 Consensus Algorithm: ${flags.consensus || 'majority'}
+🔍 Web Search: Enabled
+🤖 Model: ${modelName}
+
+WORKER DISTRIBUTION:
+${Object.entries(workerGroups).map(([type, count]) => `• ${type}: ${count} agent(s)`).join('\n')}
+
+🔧 AVAILABLE CAPABILITIES:
+1. **WEB SEARCH** - Search the internet for information, research, and data gathering
+2. **CODE GENERATION** - Write, refactor, and debug code
+3. **DATA ANALYSIS** - Analyze patterns, trends, and metrics
+4. **FILE OPERATIONS** - Read, write, and manipulate files
+5. **COLLECTIVE MEMORY** - Store and retrieve shared knowledge
+
+📋 EXECUTION PROTOCOL:
+
+1. **INITIALIZE THE HIVE**:
+   - Break down the objective into specific tasks
+   - Assign tasks to appropriate worker types
+   - Use web search for research and information gathering
+   - Coordinate worker activities
+
+2. **WEB SEARCH INTEGRATION**:
+   - Use web search for: research tasks, finding examples, documentation, best practices
+   - Search before implementing solutions
+   - Verify information from multiple sources
+   - Cite sources in your responses
+
+3. **TASK EXECUTION**:
+   - Execute tasks in parallel when possible
+   - Use web search to gather context and information
+   - Share findings with the collective memory
+   - Coordinate between workers
+
+4. **COLLECTIVE INTELLIGENCE**:
+   - Store important decisions in memory
+   - Share discoveries across workers
+   - Build consensus on critical decisions
+   - Learn from patterns and adapt
+
+🎯 OBJECTIVE: ${objective}
+
+Begin execution now. Use web search when needed for research, examples, or information gathering.
+Coordinate workers effectively and work towards completing the objective.
+
+Remember: You have access to web search - use it to enhance your responses with current information and best practices.`;
 }
 
 /**
@@ -2904,7 +3499,7 @@ async function resumeSession(args, flags) {
 
     sessionManager.close();
 
-    // Offer to spawn Claude Code with restored context
+    // Offer to spawn AI with restored context
     if (flags.claude || flags.spawn) {
       console.log('\n' + chalk.yellow('🚀 Launching Claude Code with restored context...'));
 
@@ -2913,6 +3508,29 @@ async function resumeSession(args, flags) {
 
       // Launch Claude Code with restored context
       await launchClaudeWithContext(restoredPrompt, flags, sessionId);
+    } else if (flags.ollama) {
+      console.log('\n' + chalk.yellow('🚀 Launching Ollama with restored context...'));
+
+      // Generate prompt with session context
+      const restoredPrompt = generateRestoredSessionPrompt(resumedSession);
+      
+      // Use Ollama for resume
+      const modelName = flags.model || flags['ollama-model'] || 'gemma3:1b';
+      const workers = resumedSession.statistics.totalAgents > 0 
+        ? Array(resumedSession.statistics.totalAgents).fill(null).map((_, i) => ({
+            id: `worker-${resumedSession.swarm_id}-${i}`,
+            type: 'researcher',
+          }))
+        : [];
+      
+      // Create a modified spawn function call for resume
+      await spawnOllamaInstances(
+        resumedSession.swarm_id,
+        resumedSession.swarm_name,
+        resumedSession.objective || 'Continue previous task',
+        workers,
+        { ...flags, model: modelName, resumePrompt: restoredPrompt }
+      );
     } else {
       console.log(
         '\n' +
@@ -2920,6 +3538,12 @@ async function resumeSession(args, flags) {
           ' Add --claude to spawn Claude Code with restored context',
       );
       console.log(chalk.gray('   claude-flow hive-mind resume ' + sessionId + ' --claude'));
+      console.log(
+        '\n' +
+          chalk.blue('💡 Pro Tip:') +
+          ' Add --ollama to use Ollama with restored context',
+      );
+      console.log(chalk.gray('   claude-flow hive-mind resume ' + sessionId + ' --ollama --model gemma3:1b'));
     }
   } catch (error) {
     spinner.fail('Failed to resume session');
@@ -3161,16 +3785,58 @@ async function launchClaudeWithContext(prompt, flags, sessionId) {
     console.log(chalk.green(`\n✓ Session context saved to: ${promptFile}`));
 
     const { spawn: childSpawn, execSync } = await import('child_process');
+    const { platform } = await import('os');
+    let claudeCommand = 'npx'; // Default to npx for better cross-platform support
     let claudeAvailable = false;
+    const isWindows = platform() === 'win32';
 
+    // Cross-platform check for claude executable
+    let claudeFound = false;
     try {
-      execSync('which claude', { stdio: 'ignore' });
-      claudeAvailable = true;
+      if (isWindows) {
+        // Windows: Use 'where' command and verify output
+        const result = execSync(`where claude`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+        if (result && result.trim() && !result.includes('INFO: Could not find files')) {
+          claudeFound = true;
+        }
+      } else {
+        // Unix-like systems: Use 'command -v' (more portable than 'which')
+        execSync('command -v claude', { stdio: 'ignore', shell: true });
+        claudeFound = true;
+      }
     } catch {
-      console.log(chalk.yellow('\n⚠️  Claude Code CLI not found'));
-      console.log(chalk.gray('Install Claude Code: npm install -g @anthropic-ai/claude-code'));
-      console.log(chalk.gray(`Run with: claude < ${promptFile}`));
-      return;
+      // Claude not found, will use npx
+      claudeFound = false;
+    }
+
+    if (claudeFound) {
+      // Claude found in PATH, use it directly
+      claudeCommand = 'claude';
+      claudeAvailable = true;
+    } else {
+      // Claude not found in PATH, try npx as fallback
+      try {
+        // Check if npx is available
+        if (isWindows) {
+          const npxResult = execSync(`where npx`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+          if (npxResult && npxResult.trim() && !npxResult.includes('INFO: Could not find files')) {
+            claudeAvailable = true;
+          }
+        } else {
+          execSync('command -v npx', { stdio: 'ignore', shell: true });
+          claudeAvailable = true;
+        }
+        
+        if (claudeAvailable) {
+          console.log(chalk.yellow('\n⚠️  Claude Code CLI not found in PATH'));
+          console.log(chalk.gray('Using npx to run @anthropic-ai/claude-code...'));
+        }
+      } catch {
+        console.log(chalk.yellow('\n⚠️  Claude Code CLI not found'));
+        console.log(chalk.gray('Install Claude Code: npm install -g @anthropic-ai/claude-code'));
+        console.log(chalk.gray(`Run with: claude < ${promptFile}`));
+        return;
+      }
     }
 
     if (claudeAvailable && !flags.dryRun) {
@@ -3193,12 +3859,48 @@ async function launchClaudeWithContext(prompt, flags, sessionId) {
         );
       }
 
-      console.log(chalk.blue('🔍 Debug: Spawning with args:'), claudeArgs.slice(0, 1).map(a => a.substring(0, 50) + '...'));
+      // If using npx, add the package name before other args
+      const spawnArgs = claudeCommand === 'npx' 
+        ? ['-y', '@anthropic-ai/claude-code', ...claudeArgs]
+        : claudeArgs;
+
+      console.log(chalk.blue('🔍 Debug: Spawning with args:'), spawnArgs.slice(0, 1).map(a => a.substring(0, 50) + '...'));
       
       // Use 'inherit' for interactive session (same as initial spawn)
-      const claudeProcess = childSpawn('claude', claudeArgs, {
-        stdio: 'inherit',
-        shell: false,
+      // On Windows, use shell: true for npx to resolve PATH correctly
+      // When using shell: true, we need to pass command as a string to avoid deprecation warning
+      let claudeProcess;
+      if (isWindows && claudeCommand === 'npx') {
+        // On Windows with npx, construct command string to avoid deprecation warning
+        const commandString = `npx -y @anthropic-ai/claude-code ${claudeArgs.map(arg => {
+          // Escape arguments that contain spaces or special characters
+          if (arg.includes(' ') || arg.includes('"') || arg.includes("'")) {
+            return `"${arg.replace(/"/g, '\\"')}"`;
+          }
+          return arg;
+        }).join(' ')}`;
+        claudeProcess = childSpawn(commandString, [], {
+          stdio: 'inherit',
+          shell: true,
+        });
+      } else {
+        // Unix or direct claude command - use array format
+        claudeProcess = childSpawn(claudeCommand, spawnArgs, {
+          stdio: 'inherit',
+          shell: false,
+        });
+      }
+
+      // Handle spawn errors (e.g., command not found)
+      claudeProcess.on('error', (err) => {
+        console.error(chalk.red('\n❌ Failed to spawn Claude Code:'), err.message);
+        if (err.code === 'ENOENT') {
+          console.error(chalk.yellow('\n💡 Solution:'));
+          console.error(chalk.gray('  1. Install Claude Code: npm install -g @anthropic-ai/claude-code'));
+          console.error(chalk.gray('  2. Or ensure npx is available: npm install -g npm'));
+          console.error(chalk.gray('  3. Verify your PATH includes npm/npx directories'));
+        }
+        process.exit(1);
       });
       
       console.log(chalk.blue('🔍 Debug: Claude process spawned with PID:'), claudeProcess.pid);

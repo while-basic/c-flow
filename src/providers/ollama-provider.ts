@@ -89,6 +89,7 @@ export class OllamaProvider extends BaseProvider {
       'llama-2-70b',
       'mistral-7b',
       'mixtral-8x7b',
+      'gpt-oss-20b',
       'custom-model',
     ],
     maxContextLength: {
@@ -124,6 +125,7 @@ export class OllamaProvider extends BaseProvider {
       'llama-2-70b': { promptCostPer1k: 0, completionCostPer1k: 0, currency: 'USD' },
       'mistral-7b': { promptCostPer1k: 0, completionCostPer1k: 0, currency: 'USD' },
       'mixtral-8x7b': { promptCostPer1k: 0, completionCostPer1k: 0, currency: 'USD' },
+      'gpt-oss-20b': { promptCostPer1k: 0, completionCostPer1k: 0, currency: 'USD' },
       'custom-model': { promptCostPer1k: 0, completionCostPer1k: 0, currency: 'USD' },
     },
   };
@@ -397,11 +399,6 @@ export class OllamaProvider extends BaseProvider {
         maxOutputTokens: this.capabilities.maxOutputTokens[model] || 2048,
         supportedFeatures: ['chat', 'completion'],
         pricing: this.capabilities.pricing![model],
-        metadata: {
-          parameterSize: data.details?.parameter_size,
-          quantization: data.details?.quantization_level,
-          format: data.details?.format,
-        },
       };
     } catch (error) {
       // Fallback to default info
@@ -448,8 +445,10 @@ export class OllamaProvider extends BaseProvider {
       'llama-2-70b': 'llama2:70b',
       'mistral-7b': 'mistral:7b',
       'mixtral-8x7b': 'mixtral:8x7b',
+      'gpt-oss-20b': 'gpt-oss-20b', // Pass through custom model names
       'custom-model': this.config.providerOptions?.customModel || 'llama2:latest',
     };
+    // If model not in map, pass through as-is (allows custom Ollama model names)
     return modelMap[model] || model;
   }
 
@@ -460,6 +459,7 @@ export class OllamaProvider extends BaseProvider {
       'llama-2-70b': 'Llama 2 70B - Large open-source model',
       'mistral-7b': 'Mistral 7B - Fast and efficient model',
       'mixtral-8x7b': 'Mixtral 8x7B - Mixture of experts model',
+      'gpt-oss-20b': 'GPT-OSS 20B - Open source GPT model with web search',
       'custom-model': 'Custom local model',
     };
     return descriptions[model] || 'Local language model via Ollama';

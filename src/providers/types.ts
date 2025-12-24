@@ -47,6 +47,7 @@ export type LLMModel =
   | 'llama-2-70b'
   | 'mistral-7b'
   | 'mixtral-8x7b'
+  | 'gpt-oss-20b'
   | 'custom-model';
 
 // ===== BASE INTERFACES =====
