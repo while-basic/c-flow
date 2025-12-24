@@ -109,6 +109,9 @@ ${chalk.bold('EXAMPLES:')}
 
   ${chalk.gray('# Spawn with Ollama (local models with web search)')}
   claude-flow hive-mind spawn "Research AI trends" --ollama --model gemma3:1b
+  
+  ${chalk.gray('# Autonomous mode - work independently towards objective')}
+  claude-flow hive-mind spawn "Create documentation" --ollama --autonomous --max-iterations 5
 
   ${chalk.gray('# Auto-spawn coordinated Claude Code instances')}
   claude-flow hive-mind spawn "Research AI trends" --auto-spawn --verbose
@@ -146,6 +149,12 @@ ${chalk.bold('OPTIONS:')}
   --no-web-search        Disable web search (use with --ollama)
   --chat                 Enable continuous chat mode after initial response (streaming)
   --interactive          Alias for --chat (enables continuous chat mode)
+  --autonomous           Enable autonomous mode - work independently towards objective
+  --auto                 Alias for --autonomous
+  --max-iterations <n>   Maximum autonomous iterations (default: 10)
+  --iteration-delay <ms> Delay between autonomous iterations in ms (default: 2000)
+  --mcp                  Enable MCP tools knowledge in prompt (default: enabled)
+  --no-mcp               Disable MCP tools knowledge in prompt
   --auto-spawn           Automatically spawn Claude Code instances
   --execute              Execute Claude Code spawn commands immediately
 
@@ -2887,8 +2896,133 @@ async function spawnOllamaInstances(swarmId, swarmName, objective, workers, flag
           console.log(chalk.gray(`\n📊 Tokens: ${response.usage.totalTokens} (prompt: ${response.usage.promptTokens}, completion: ${response.usage.completionTokens})`));
         }
 
-        // Continuous chat mode - maintain conversation history
-        if (flags.chat || flags.interactive) {
+        // Autonomous mode - work independently towards objective
+        if (flags.autonomous || flags.auto) {
+          console.log(chalk.cyan('\n🤖 Autonomous mode enabled. Working independently towards objective...\n'));
+          
+          const conversationHistory = [
+            { role: 'system', content: 'You are a Hive Mind Queen coordinator orchestrating multiple AI agents. You are operating in AUTONOMOUS MODE - work independently to complete the objective without waiting for user input. Break down tasks, execute them systematically, and iterate until the objective is complete. Report progress and final results when done.' },
+            { role: 'user', content: safePrompt },
+            { role: 'assistant', content: totalContent },
+          ];
+          
+          const maxIterations = flags['max-iterations'] || 10;
+          const iterationDelay = flags['iteration-delay'] || 2000; // 2 seconds between iterations
+          let iterationCount = 0;
+          let isComplete = false;
+          
+          const autonomousIteration = async () => {
+            if (isComplete || iterationCount >= maxIterations) {
+              if (iterationCount >= maxIterations) {
+                console.log(chalk.yellow(`\n⚠️  Reached maximum iterations (${maxIterations}). Stopping autonomous mode.`));
+              } else {
+                console.log(chalk.green('\n✅ Objective completed in autonomous mode!'));
+              }
+              return;
+            }
+            
+            iterationCount++;
+            console.log(chalk.gray(`\n[Autonomous Iteration ${iterationCount}/${maxIterations}]`));
+            console.log(chalk.cyan('🤖 Assistant> '));
+            
+            // Generate autonomous follow-up prompt
+            const autonomousPrompt = `Continue working autonomously towards the objective. Analyze what has been done, identify next steps, and execute them. If the objective is complete, clearly state "OBJECTIVE COMPLETE" and summarize the results. Otherwise, proceed with the next logical step.`;
+            conversationHistory.push({ role: 'user', content: autonomousPrompt });
+            
+            const chatRequestBody = {
+              model: modelName,
+              messages: conversationHistory,
+              options: {
+                temperature: 0.7,
+                top_p: 0.9,
+                num_predict: 4096,
+              },
+              stream: true,
+            };
+            
+            try {
+              const chatResponse = await fetch(`${ollamaUrl}/api/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(chatRequestBody),
+              });
+              
+              if (!chatResponse.ok || !chatResponse.body) {
+                throw new Error(`Chat API error: ${chatResponse.statusText}`);
+              }
+              
+              const chatReader = chatResponse.body.getReader();
+              const chatDecoder = new TextDecoder();
+              let chatBuffer = '';
+              let chatContent = '';
+              
+              while (true) {
+                const { done, value } = await chatReader.read();
+                if (done) break;
+                
+                chatBuffer += chatDecoder.decode(value, { stream: true });
+                const lines = chatBuffer.split('\n');
+                chatBuffer = lines.pop() || '';
+                
+                for (const line of lines) {
+                  if (line.trim() === '') continue;
+                  try {
+                    const chunk = JSON.parse(line);
+                    if (chunk.message?.content) {
+                      chatContent += chunk.message.content;
+                      process.stdout.write(chunk.message.content);
+                    }
+                    if (chunk.done) break;
+                  } catch (e) {
+                    // Skip invalid JSON
+                  }
+                }
+              }
+              
+              console.log('\n'); // Newline after streaming
+              
+              // Add assistant response to history
+              conversationHistory.push({ role: 'assistant', content: chatContent });
+              
+              // Check if objective is complete
+              if (chatContent.toLowerCase().includes('objective complete') || 
+                  chatContent.toLowerCase().includes('task complete') ||
+                  chatContent.toLowerCase().includes('completed successfully')) {
+                isComplete = true;
+                console.log(chalk.green('\n✅ Objective marked as complete by autonomous agent!'));
+                return;
+              }
+              
+              // Continue to next iteration after delay
+              if (!isComplete && iterationCount < maxIterations) {
+                await new Promise(resolve => setTimeout(resolve, iterationDelay));
+                await autonomousIteration();
+              }
+              
+            } catch (chatError) {
+              console.error(chalk.red('\n❌ Autonomous iteration error:'), chatError.message);
+              // Continue despite errors
+              if (iterationCount < maxIterations) {
+                await new Promise(resolve => setTimeout(resolve, iterationDelay));
+                await autonomousIteration();
+              }
+            }
+          };
+          
+          // Start autonomous iterations
+          await autonomousIteration();
+          
+          // Save final conversation
+          const finalResponseFile = path.join(sessionsDir, `hive-mind-ollama-autonomous-${swarmId}.txt`);
+          const finalConversation = conversationHistory
+            .filter(msg => msg.role !== 'system')
+            .map(msg => `${msg.role.toUpperCase()}: ${msg.content}`)
+            .join('\n\n---\n\n');
+          await writeFile(finalResponseFile, finalConversation, 'utf8');
+          console.log(chalk.green(`\n✓ Autonomous session saved to: ${finalResponseFile}`));
+        }
+        // Continuous chat mode - maintain conversation history (interactive)
+        else if (flags.chat || flags.interactive) {
           console.log(chalk.cyan('\n💬 Continuous chat mode enabled. Type your message or /exit to quit.\n'));
           
           const conversationHistory = [
@@ -3015,10 +3149,13 @@ async function spawnOllamaInstances(swarmId, swarmName, objective, workers, flag
     console.log(chalk.gray('─'.repeat(30)));
     console.log('• Use --model to specify different Ollama models');
     console.log('• Web search is automatically enabled (use --no-web-search to disable)');
+    console.log('• MCP tools knowledge is enabled by default (use --no-mcp to disable)');
     console.log('• Use --chat or --interactive for continuous chat mode with streaming');
+    console.log('• Use --autonomous or --auto for autonomous mode (works independently)');
     console.log('• For better search results, set PERPLEXITY_API_KEY in .env');
     console.log('• Monitor with: claude-flow hive-mind status');
     console.log('• Check Ollama logs: ollama logs');
+    console.log('• View MCP tools: claude-flow mcp tools');
 
   } catch (error) {
     spinner.fail('Failed to prepare Ollama coordination');
@@ -3063,11 +3200,127 @@ function extractSearchQueries(objective) {
 function generateOllamaHiveMindPrompt(swarmId, swarmName, objective, workers, workerGroups, flags, modelName) {
   const workerTypesList = Object.keys(workerGroups).join(', ');
   const workerCount = workers.length;
+  
+  // Generate MCP tools section
+  const mcpToolsSection = flags.mcp !== false ? `
+🔌 AVAILABLE MCP (Model Context Protocol) TOOLS (87+ tools):
+
+📊 SWARM COORDINATION (12 tools):
+  • swarm_init - Initialize swarm with topology (hierarchical, mesh, ring, star)
+  • agent_spawn - Create specialized AI agents (researcher, coder, analyst, architect, tester, coordinator, reviewer, optimizer)
+  • task_orchestrate - Orchestrate complex workflows
+  • swarm_status - Monitor swarm health/performance
+  • agent_list - List active agents & capabilities
+  • agent_metrics - Agent performance metrics
+  • swarm_monitor - Real-time swarm monitoring
+  • topology_optimize - Auto-optimize swarm topology
+  • load_balance - Distribute tasks efficiently
+  • coordination_sync - Sync agent coordination
+  • swarm_scale - Auto-scale agent count
+  • swarm_destroy - Gracefully shutdown swarm
+
+🧠 NEURAL NETWORKS & AI (15 tools):
+  • neural_train - Train neural patterns with WASM SIMD acceleration (27 models)
+  • neural_patterns - Analyze cognitive patterns
+  • neural_predict - Make AI predictions
+  • model_load/save - Load/save pre-trained models
+  • wasm_optimize - WASM SIMD optimization (2.8-4.4x speed)
+  • inference_run - Run neural inference
+  • pattern_recognize - Pattern recognition
+  • cognitive_analyze - Cognitive behavior analysis
+  • learning_adapt - Adaptive learning
+  • neural_compress - Compress neural models
+  • ensemble_create - Create model ensembles
+  • transfer_learn - Transfer learning
+  • neural_explain - AI explainability
+
+💾 MEMORY & PERSISTENCE (12 tools):
+  • memory_usage - Store/retrieve persistent data (5 operations: store, retrieve, list, delete, search)
+  • memory_search - Search memory with patterns
+  • memory_persist - Cross-session persistence
+  • memory_namespace - Namespace management with TTL
+  • memory_backup/restore - Backup and restore memory stores
+  • memory_compress - Compress memory data
+  • memory_sync - Sync across instances
+  • cache_manage - Manage coordination cache
+  • state_snapshot - Create state snapshots
+  • context_restore - Restore execution context
+  • memory_analytics - Analyze memory usage
+
+📊 ANALYSIS & MONITORING (13 tools):
+  • task_status - Check task execution status
+  • task_results - Get task completion results
+  • benchmark_run - Performance benchmarks
+  • bottleneck_analyze - Identify bottlenecks
+  • performance_report - Generate performance reports (24h/7d/30d timeframes)
+  • token_usage - Analyze token consumption (32.3% reduction through optimization)
+  • metrics_collect - Collect system metrics
+  • trend_analysis - Analyze performance trends
+  • cost_analysis - Cost and resource analysis
+  • quality_assess - Quality assessment
+  • error_analysis - Error pattern analysis
+  • usage_stats - Usage statistics
+  • health_check - System health monitoring
+
+🔧 WORKFLOW & AUTOMATION (11 tools):
+  • workflow_create - Create custom workflows
+  • workflow_execute - Execute predefined workflows
+  • workflow_export - Export workflow definitions
+  • sparc_mode - Run SPARC development modes (17 modes)
+  • automation_setup - Setup automation rules
+  • pipeline_create - Create CI/CD pipelines
+  • scheduler_manage - Manage task scheduling
+  • trigger_setup - Setup event triggers
+  • workflow_template - Manage workflow templates
+  • batch_process - Batch processing
+  • parallel_execute - Execute tasks in parallel
+
+🐙 GITHUB INTEGRATION (8 tools):
+  • github_repo_analyze - Repository analysis
+  • github_pr_manage - Pull request management
+  • github_issue_track - Issue tracking & triage
+  • github_release_coord - Release coordination
+  • github_workflow_auto - Workflow automation
+  • github_code_review - Automated code review
+  • github_sync_coord - Multi-repo sync coordination
+  • github_metrics - Repository metrics
+
+🤖 DAA (Dynamic Agent Architecture) (8 tools):
+  • daa_agent_create - Create dynamic agents
+  • daa_capability_match - Match capabilities to tasks
+  • daa_resource_alloc - Resource allocation
+  • daa_lifecycle_manage - Agent lifecycle management
+  • daa_communication - Inter-agent communication
+  • daa_consensus - Consensus mechanisms
+  • daa_fault_tolerance - Fault tolerance & recovery
+  • daa_optimization - Performance optimization
+
+⚙️ SYSTEM & UTILITIES (8 tools):
+  • terminal_execute - Execute terminal commands
+  • config_manage - Configuration management
+  • features_detect - Feature detection
+  • security_scan - Security scanning
+  • backup_create - Create system backups
+  • restore_system - System restoration
+  • log_analysis - Log analysis & insights
+  • diagnostic_run - System diagnostics
+
+💡 MCP TOOL USAGE INSTRUCTIONS:
+While you cannot directly call MCP tools (they require Claude Code integration), you should:
+1. Understand what each tool does and when it would be useful
+2. Describe how you would use these tools to accomplish the objective
+3. Plan workflows that leverage these capabilities
+4. Recommend tool usage strategies in your responses
+5. Consider MCP tools when breaking down tasks and assigning work
+6. Reference specific tools when describing how to achieve goals
+
+MCP tools provide: 2.8-4.4x speed improvement, 32.3% token reduction, 84.8% SWE-Bench solve rate, 
+WASM neural processing, cross-session memory persistence, and full Claude Code integration.` : '';
 
   return `🧠 HIVE MIND COLLECTIVE INTELLIGENCE SYSTEM (Ollama ${modelName})
 ═══════════════════════════════════════════════
 
-You are the Queen coordinator of a Hive Mind swarm using Ollama (${modelName}) with web search capabilities.
+You are the Queen coordinator of a Hive Mind swarm using Ollama (${modelName}) with web search capabilities and access to MCP (Model Context Protocol) tools knowledge.
 
 HIVE MIND CONFIGURATION:
 📌 Swarm ID: ${swarmId}
@@ -3078,16 +3331,18 @@ HIVE MIND CONFIGURATION:
 🤝 Consensus Algorithm: ${flags.consensus || 'majority'}
 🔍 Web Search: Enabled
 🤖 Model: ${modelName}
+🔌 MCP Tools: Available (87+ tools)${flags.mcp === false ? ' (Disabled)' : ''}
 
 WORKER DISTRIBUTION:
 ${Object.entries(workerGroups).map(([type, count]) => `• ${type}: ${count} agent(s)`).join('\n')}
 
-🔧 AVAILABLE CAPABILITIES:
+🔧 CORE CAPABILITIES:
 1. **WEB SEARCH** - Search the internet for information, research, and data gathering
 2. **CODE GENERATION** - Write, refactor, and debug code
 3. **DATA ANALYSIS** - Analyze patterns, trends, and metrics
 4. **FILE OPERATIONS** - Read, write, and manipulate files
 5. **COLLECTIVE MEMORY** - Store and retrieve shared knowledge
+${mcpToolsSection}
 
 📋 EXECUTION PROTOCOL:
 
@@ -3117,10 +3372,34 @@ ${Object.entries(workerGroups).map(([type, count]) => `• ${type}: ${count} age
 
 🎯 OBJECTIVE: ${objective}
 
-Begin execution now. Use web search when needed for research, examples, or information gathering.
-Coordinate workers effectively and work towards completing the objective.
+📋 EXECUTION STRATEGY:
 
-Remember: You have access to web search - use it to enhance your responses with current information and best practices.`;
+1. **LEVERAGE MCP TOOLS KNOWLEDGE**:
+   - Understand what MCP tools are available and their capabilities
+   - Plan your approach considering how MCP tools would be used
+   - Describe tool usage strategies in your responses
+   - Break down tasks considering MCP tool capabilities
+   - Reference specific tools when describing solutions
+
+2. **USE WEB SEARCH**:
+   - Search for research, examples, documentation, best practices
+   - Verify information from multiple sources
+   - Cite sources in your responses
+
+3. **COORDINATE WORKERS**:
+   - Assign tasks based on worker capabilities
+   - Use parallel execution when possible
+   - Share findings through collective memory
+   - Build consensus on critical decisions
+
+4. **AUTONOMOUS MODE** (if enabled):
+   - Work independently towards objective completion
+   - Iterate automatically until done
+   - Report progress and final results
+
+Begin execution now. Leverage your knowledge of MCP tools, use web search for research, and coordinate workers effectively to complete the objective.
+
+Remember: You have access to web search and knowledge of 87+ MCP tools - use this knowledge to plan and execute effectively.`;
 }
 
 /**
