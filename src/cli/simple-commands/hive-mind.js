@@ -144,6 +144,8 @@ ${chalk.bold('OPTIONS:')}
   --model <name>         Ollama model name (default: gemma3:1b, codellama:7b, deepseek-coder:1.3b, etc.)
   --ollama-url <url>     Ollama API URL (default: http://localhost:11434)
   --no-web-search        Disable web search (use with --ollama)
+  --chat                 Enable continuous chat mode after initial response (streaming)
+  --interactive          Alias for --chat (enables continuous chat mode)
   --auto-spawn           Automatically spawn Claude Code instances
   --execute              Execute Claude Code spawn commands immediately
 
@@ -2762,7 +2764,7 @@ async function spawnOllamaInstances(swarmId, swarmName, objective, workers, flag
             top_p: 0.9,
             num_predict: 4096,
           },
-          stream: false,
+          stream: true, // Enable streaming for real-time output
         };
         
         let requestBodyString;
@@ -2794,70 +2796,209 @@ async function spawnOllamaInstances(swarmId, swarmName, objective, workers, flag
           throw new Error(`Failed to connect to Ollama: ${fetchError.message}. Make sure Ollama is running at ${ollamaUrl}`);
         }
         
-        // Read response text once
-        let responseText;
-        try {
-          responseText = await ollamaResponse.text();
-        } catch (readError) {
-          throw new Error(`Failed to read response from Ollama: ${readError.message}`);
-        }
-        
         if (!ollamaResponse.ok) {
-          const errorPreview = responseText ? responseText.substring(0, 500) : 'No response body';
+          const errorText = await ollamaResponse.text();
+          const errorPreview = errorText ? errorText.substring(0, 500) : 'No response body';
           throw new Error(`Ollama API error (${ollamaResponse.status} ${ollamaResponse.statusText}): ${errorPreview}`);
         }
         
-        // Parse response with error handling
-        let ollamaData;
-        try {
-          if (!responseText || responseText.trim() === '') {
-            throw new Error('Empty response from Ollama API');
-          }
-          
-          // Try to parse JSON
-          ollamaData = JSON.parse(responseText);
-        } catch (parseError) {
-          // Provide detailed error information
-          const errorDetails = {
-            message: parseError.message,
-            responseLength: responseText.length,
-            responseStart: responseText.substring(0, 100),
-            responseEnd: responseText.substring(Math.max(0, responseText.length - 100)),
-          };
-          
-          if (flags.verbose) {
-            console.error(chalk.red('\n❌ JSON Parse Error Details:'));
-            console.error(chalk.gray(JSON.stringify(errorDetails, null, 2)));
-          }
-          
-          throw new Error(
-            `Failed to parse Ollama response: ${parseError.message}\n` +
-            `Response length: ${responseText.length} chars\n` +
-            `First 200 chars: ${responseText.substring(0, 200)}\n` +
-            `Last 200 chars: ${responseText.substring(Math.max(0, responseText.length - 200))}`
-          );
+        if (!ollamaResponse.body) {
+          throw new Error('Response body is null - streaming not available');
         }
         
+        // Stream the response in real-time
+        spinner.succeed('Ollama streaming started!');
+        console.log('\n' + chalk.bold('📊 Streaming Response:'));
+        console.log(chalk.gray('─'.repeat(60)));
+        
+        const reader = ollamaResponse.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let totalContent = '';
+        let promptTokens = 0;
+        let completionTokens = 0;
+        
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            
+            for (const line of lines) {
+              if (line.trim() === '') continue;
+              
+              try {
+                const chunk = JSON.parse(line);
+                
+                // Extract and stream content
+                if (chunk.message?.content) {
+                  const content = chunk.message.content;
+                  totalContent += content;
+                  // Stream output to console in real-time
+                  process.stdout.write(content);
+                }
+                
+                // Track token usage
+                if (chunk.prompt_eval_count !== undefined) {
+                  promptTokens = chunk.prompt_eval_count;
+                }
+                if (chunk.eval_count !== undefined) {
+                  completionTokens = chunk.eval_count;
+                }
+                
+                // Check if done
+                if (chunk.done) {
+                  break;
+                }
+              } catch (parseError) {
+                // Skip invalid JSON lines (might be empty or partial)
+                if (flags.verbose && line.trim().length > 0 && !line.includes('done')) {
+                  // Only log if it's not a common partial line
+                }
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        
+        // Add newline after streaming completes
+        console.log('\n');
+        
         const response = {
-          content: ollamaData.message?.content || ollamaData.response || '',
+          content: totalContent,
           model: modelName,
           usage: {
-            promptTokens: ollamaData.prompt_eval_count || 0,
-            completionTokens: ollamaData.eval_count || 0,
-            totalTokens: (ollamaData.prompt_eval_count || 0) + (ollamaData.eval_count || 0),
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            totalTokens: promptTokens + completionTokens,
           },
         };
-
-        spinner.succeed('Ollama execution completed!');
-        
-        console.log('\n' + chalk.bold('📊 Response:'));
-        console.log(chalk.gray('─'.repeat(60)));
-        console.log(response.content);
         
         // Save response
         const responseFile = path.join(sessionsDir, `hive-mind-ollama-response-${swarmId}.txt`);
         await writeFile(responseFile, response.content, 'utf8');
         console.log(chalk.green(`\n✓ Response saved to: ${responseFile}`));
+        
+        if (flags.verbose && response.usage.totalTokens > 0) {
+          console.log(chalk.gray(`\n📊 Tokens: ${response.usage.totalTokens} (prompt: ${response.usage.promptTokens}, completion: ${response.usage.completionTokens})`));
+        }
+
+        // Continuous chat mode - maintain conversation history
+        if (flags.chat || flags.interactive) {
+          console.log(chalk.cyan('\n💬 Continuous chat mode enabled. Type your message or /exit to quit.\n'));
+          
+          const conversationHistory = [
+            { role: 'system', content: 'You are a Hive Mind Queen coordinator orchestrating multiple AI agents. You have access to web search results - use them to provide accurate, up-to-date information. Cite sources when referencing web search results.' },
+            { role: 'user', content: safePrompt },
+            { role: 'assistant', content: totalContent },
+          ];
+          
+          const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout,
+            prompt: chalk.cyan('💬 You> '),
+          });
+          
+          const processChatMessage = async (userInput) => {
+            if (!userInput.trim()) {
+              rl.prompt();
+              return;
+            }
+            
+            // Handle commands
+            if (userInput.trim() === '/exit' || userInput.trim() === '/quit') {
+              console.log(chalk.gray('\n👋 Ending chat session...'));
+              rl.close();
+              return;
+            }
+            
+            if (userInput.trim() === '/clear') {
+              conversationHistory.splice(1); // Keep only system message
+              console.log(chalk.green('✓ Conversation history cleared\n'));
+              rl.prompt();
+              return;
+            }
+            
+            // Add user message to history
+            conversationHistory.push({ role: 'user', content: userInput });
+            
+            // Stream response
+            console.log(chalk.cyan('\n🤖 Assistant> '));
+            
+            const chatRequestBody = {
+              model: modelName,
+              messages: conversationHistory,
+              options: {
+                temperature: 0.7,
+                top_p: 0.9,
+                num_predict: 4096,
+              },
+              stream: true,
+            };
+            
+            try {
+              const chatResponse = await fetch(`${ollamaUrl}/api/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(chatRequestBody),
+              });
+              
+              if (!chatResponse.ok || !chatResponse.body) {
+                throw new Error(`Chat API error: ${chatResponse.statusText}`);
+              }
+              
+              const chatReader = chatResponse.body.getReader();
+              const chatDecoder = new TextDecoder();
+              let chatBuffer = '';
+              let chatContent = '';
+              
+              while (true) {
+                const { done, value } = await chatReader.read();
+                if (done) break;
+                
+                chatBuffer += chatDecoder.decode(value, { stream: true });
+                const lines = chatBuffer.split('\n');
+                chatBuffer = lines.pop() || '';
+                
+                for (const line of lines) {
+                  if (line.trim() === '') continue;
+                  try {
+                    const chunk = JSON.parse(line);
+                    if (chunk.message?.content) {
+                      chatContent += chunk.message.content;
+                      process.stdout.write(chunk.message.content);
+                    }
+                    if (chunk.done) break;
+                  } catch (e) {
+                    // Skip invalid JSON
+                  }
+                }
+              }
+              
+              console.log('\n'); // Newline after streaming
+              
+              // Add assistant response to history
+              conversationHistory.push({ role: 'assistant', content: chatContent });
+              
+            } catch (chatError) {
+              console.error(chalk.red('\n❌ Chat error:'), chatError.message);
+            }
+            
+            rl.prompt();
+          };
+          
+          rl.on('line', processChatMessage);
+          rl.on('SIGINT', () => {
+            console.log(chalk.gray('\n\n👋 Ending chat session...'));
+            rl.close();
+          });
+          
+          rl.prompt();
+        }
 
       } catch (error) {
         spinner.fail('Ollama execution failed');
@@ -2874,6 +3015,7 @@ async function spawnOllamaInstances(swarmId, swarmName, objective, workers, flag
     console.log(chalk.gray('─'.repeat(30)));
     console.log('• Use --model to specify different Ollama models');
     console.log('• Web search is automatically enabled (use --no-web-search to disable)');
+    console.log('• Use --chat or --interactive for continuous chat mode with streaming');
     console.log('• For better search results, set PERPLEXITY_API_KEY in .env');
     console.log('• Monitor with: claude-flow hive-mind status');
     console.log('• Check Ollama logs: ollama logs');
